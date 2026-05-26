@@ -33,26 +33,42 @@
     const CFG = {
       WORLD_W: 4000,
       GROUND_H: 60,
-      GRAVITY: 1100,
+      GRAVITY: 1900,
       PLAYER_SPEED: 230,
-      JUMP_V: -540,
+      JUMP_V: -1000,
       FIRE_RATE_MS: 280,
       BOOSTED_FIRE_RATE_MS: 110,
       BULLET_SPEED: 700,
       ENEMY_SPEED: 95,
-      ENEMY_SPAWN_MS: 1400,
-      PICKUP_SPAWN_MS: 5200,
+      PATROLLER_SPEED: 70,
+      SHOOTER_FIRE_MS: 1500,
+      SHOOTER_BULLET_SPEED: 250,
+      ENEMY_SPAWN_MU: 3000,
+      ENEMY_SPAWN_SIGMA: 2000,
+      ENEMY_SPAWN_MIN: 300,
+      ENEMY_SPAWN_MAX: 8000,
       HEALTH_MAX: 5,
       ENEMY_DAMAGE: 1,
       INVULN_MS: 900,
       POWERUP_DURATION_MS: 6000,
       SCORE_PER_KILL: 10,
       HEAL_AMOUNT: 2,
+      PICKUP_LIFETIME_MS: 5000,
+      PICKUP_BLINK_MS: 1000,
+      HP: { runner: 1, patroller: 2, shooter: 2 },
+      DROP_RATE: { runner: 0.50, patroller: 0.70, shooter: 0.80 },
+      HEALTH_SHARE: { runner: 0.70, patroller: 0.50, shooter: 0.30 },
+      KIND_WEIGHTS_GROUND: { runner: 0.60, shooter: 0.30, patroller: 0.10 },
+      KIND_WEIGHTS_PLATFORM: { patroller: 0.60, shooter: 0.30, runner: 0.10 },
+      ENEMY_RADIUS: 18,
       COLORS: {
         bg: 0x1a1410,
         player: 0xffffff,
-        enemy: 0xd84545,
+        runner: 0xd84545,
+        patroller: 0xe6a23c,
+        shooter: 0x4a6fa5,
         bullet: 0xffe45c,
+        enemyBullet: 0xff8c3a,
         health: 0x6cc55a,
         powerup: 0x4aa3ff,
         ground: 0x3a342c
@@ -62,9 +78,16 @@
     class MainScene extends Phaser.Scene {
       constructor() { super('MainScene'); }
 
+      preload() {
+        this.load.image('bg', 'assets/background.png');
+        this.load.audio('soundtrack', 'assets/soundtrack.mp3');
+      }
+
       create() {
         this.cameras.main.setBackgroundColor('#1a1410');
+        this.buildBackground();
         this.buildTextures();
+        this.setupMusic();
 
         const vh = this.scale.height;
         this.physics.world.setBounds(0, 0, CFG.WORLD_W, vh);
@@ -78,6 +101,7 @@
         this.currentFireRate = CFG.FIRE_RATE_MS;
         this.powerupUntil = 0;
         this.invulnUntil = 0;
+        this.nextEnemyEvent = null;
 
         this.buildWorld(vh);
         this.spawnPlayer(vh);
@@ -85,8 +109,37 @@
         this.setupCollisions();
         this.setupInput();
         this.setupCamera(vh);
-        this.startSpawners();
+        this.scheduleNextEnemy();
         this.buildHud();
+      }
+
+      buildBackground() {
+        const vh = this.scale.height;
+        const tex = this.textures.get('bg').getSourceImage();
+        const bg = this.add.tileSprite(0, 0, CFG.WORLD_W, vh, 'bg')
+          .setOrigin(0, 0)
+          .setDepth(-1000)
+          .setScrollFactor(1, 1);
+        const scale = vh / tex.height;
+        bg.setTileScale(scale, scale);
+      }
+
+      setupMusic() {
+        this.music = this.sound.add('soundtrack', { loop: true, volume: 0.5 });
+        const start = () => {
+          if (this.sound.locked) return;
+          if (!this.music.isPlaying) this.music.play();
+        };
+        if (this.sound.locked) {
+          this.sound.once(Phaser.Sound.Events.UNLOCKED, start);
+        } else {
+          start();
+        }
+        this.input.once('pointerdown', start);
+        this.input.keyboard.once('keydown', start);
+        this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+          if (this.music) this.music.stop();
+        });
       }
 
       buildTextures() {
@@ -98,8 +151,11 @@
           g.destroy();
         };
         mkCircle('tex_player', CFG.COLORS.player, 20);
-        mkCircle('tex_enemy', CFG.COLORS.enemy, 18);
+        mkCircle('tex_runner', CFG.COLORS.runner, CFG.ENEMY_RADIUS);
+        mkCircle('tex_patroller', CFG.COLORS.patroller, CFG.ENEMY_RADIUS);
+        mkCircle('tex_shooter', CFG.COLORS.shooter, CFG.ENEMY_RADIUS);
         mkCircle('tex_bullet', CFG.COLORS.bullet, 5);
+        mkCircle('tex_enemy_bullet', CFG.COLORS.enemyBullet, 5);
         mkCircle('tex_health', CFG.COLORS.health, 12);
         mkCircle('tex_powerup', CFG.COLORS.powerup, 12);
 
@@ -126,11 +182,23 @@
           { x: 3100, y: vh - 200, w: 220 },
           { x: 3500, y: vh - 280, w: 180 }
         ];
-        this.platformTops = [vh - CFG.GROUND_H];
+
+        this.surfaces = [{
+          left: 0,
+          right: CFG.WORLD_W,
+          top: vh - CFG.GROUND_H,
+          isGround: true
+        }];
+
         for (const p of platDefs) {
           const plat = this.platforms.create(p.x, p.y, 'tex_ground');
           plat.setDisplaySize(p.w, 20).refreshBody();
-          this.platformTops.push(p.y - 10);
+          this.surfaces.push({
+            left: p.x - p.w / 2,
+            right: p.x + p.w / 2,
+            top: p.y - 10,
+            isGround: false
+          });
         }
       }
 
@@ -143,29 +211,33 @@
 
       setupGroups() {
         this.bullets = this.physics.add.group();
+        this.enemyBullets = this.physics.add.group({ allowGravity: false });
         this.enemies = this.physics.add.group();
         this.pickups = this.physics.add.group({ allowGravity: false });
       }
 
       setupCollisions() {
         this.physics.add.collider(this.enemies, this.platforms);
-        this.physics.add.collider(this.pickups, this.platforms);
 
         this.physics.add.overlap(this.bullets, this.enemies, (bullet, enemy) => {
           bullet.destroy();
-          enemy.destroy();
-          this.score += CFG.SCORE_PER_KILL;
-          this.scoreText.setText('Score: ' + this.score);
+          if (!enemy.active) return;
+          const hp = enemy.getData('hp') - 1;
+          enemy.setData('hp', hp);
+          if (hp <= 0) {
+            this.onEnemyKilled(enemy);
+          } else {
+            this.ensureHpBar(enemy);
+          }
         });
 
         this.physics.add.overlap(this.player, this.enemies, (player, enemy) => {
-          if (this.time.now < this.invulnUntil || this.gameOver) return;
-          this.health -= CFG.ENEMY_DAMAGE;
-          this.invulnUntil = this.time.now + CFG.INVULN_MS;
-          this.updateHealthBar();
-          if (this.health <= 0) {
-            this.enterGameOver();
-          }
+          this.damagePlayer();
+        });
+
+        this.physics.add.overlap(this.player, this.enemyBullets, (player, bullet) => {
+          bullet.destroy();
+          this.damagePlayer();
         });
 
         this.physics.add.overlap(this.player, this.pickups, (player, pickup) => {
@@ -180,6 +252,14 @@
           }
           pickup.destroy();
         });
+      }
+
+      damagePlayer() {
+        if (this.time.now < this.invulnUntil || this.gameOver) return;
+        this.health -= CFG.ENEMY_DAMAGE;
+        this.invulnUntil = this.time.now + CFG.INVULN_MS;
+        this.updateHealthBar();
+        if (this.health <= 0) this.enterGameOver();
       }
 
       setupInput() {
@@ -199,46 +279,108 @@
         this.cameras.main.startFollow(this.player, true, 0.1, 0);
       }
 
-      startSpawners() {
-        this.enemySpawner = this.time.addEvent({
-          delay: CFG.ENEMY_SPAWN_MS,
-          loop: true,
-          callback: () => this.spawnEnemy()
+      boxMuller(mu, sigma) {
+        const u1 = Math.max(Math.random(), 1e-9);
+        const u2 = Math.random();
+        const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        return mu + sigma * z;
+      }
+
+      scheduleNextEnemy() {
+        if (this.gameOver) return;
+        const raw = this.boxMuller(CFG.ENEMY_SPAWN_MU, CFG.ENEMY_SPAWN_SIGMA);
+        const delay = Phaser.Math.Clamp(raw, CFG.ENEMY_SPAWN_MIN, CFG.ENEMY_SPAWN_MAX);
+        this.nextEnemyEvent = this.time.delayedCall(delay, () => {
+          this.spawnEnemy();
+          this.scheduleNextEnemy();
         });
-        this.pickupSpawner = this.time.addEvent({
-          delay: CFG.PICKUP_SPAWN_MS,
-          loop: true,
-          callback: () => this.spawnPickup()
-        });
+      }
+
+      pickSpawnSurface() {
+        const cam = this.cameras.main;
+        const camRight = cam.scrollX + cam.width;
+        const r = CFG.ENEMY_RADIUS;
+        const candidates = [];
+        for (const s of this.surfaces) {
+          if (s.isGround) {
+            const sx = Math.min(camRight + 40, CFG.WORLD_W - r - 2);
+            if (sx > r + 2) {
+              candidates.push({ surface: s, spawnLeft: sx, spawnRight: sx });
+            }
+          } else if (s.left > camRight && s.left < camRight + cam.width) {
+            candidates.push({ surface: s, spawnLeft: s.left + r, spawnRight: s.right - r });
+          }
+        }
+        if (candidates.length === 0) return null;
+        return Phaser.Utils.Array.GetRandom(candidates);
+      }
+
+      pickKind(surface) {
+        const weights = surface.isGround ? CFG.KIND_WEIGHTS_GROUND : CFG.KIND_WEIGHTS_PLATFORM;
+        const r = Math.random();
+        let acc = 0;
+        for (const k of Object.keys(weights)) {
+          acc += weights[k];
+          if (r < acc) return k;
+        }
+        return Object.keys(weights)[0];
       }
 
       spawnEnemy() {
         if (this.gameOver) return;
-        const cam = this.cameras.main;
-        const x = Math.min(cam.scrollX + cam.width + 40, CFG.WORLD_W - 20);
-        const vh = this.scale.height;
-        const y = vh - CFG.GROUND_H - 30;
-        const e = this.enemies.create(x, y, 'tex_enemy');
-        e.body.setCircle(18);
+        const pick = this.pickSpawnSurface();
+        if (!pick) return;
+        const surface = pick.surface;
+        const kind = this.pickKind(surface);
+        const r = CFG.ENEMY_RADIUS;
+        const x = pick.spawnLeft === pick.spawnRight
+          ? pick.spawnLeft
+          : Phaser.Math.Between(pick.spawnLeft, pick.spawnRight);
+        const y = surface.top - r - 1;
+        const tex = kind === 'runner' ? 'tex_runner' : kind === 'patroller' ? 'tex_patroller' : 'tex_shooter';
+        const e = this.enemies.create(x, y, tex);
+        e.body.setCircle(r);
         e.setCollideWorldBounds(false);
+        const hp = CFG.HP[kind];
+        e.setData('kind', kind);
+        e.setData('hp', hp);
+        e.setData('hpMax', hp);
+        e.setData('surface', surface);
+        if (kind === 'shooter') {
+          e.setImmovable(true);
+          e.setData('nextFireAt', this.time.now + CFG.SHOOTER_FIRE_MS);
+          e.setData('facing', this.player.x > x ? 1 : -1);
+        } else if (kind === 'patroller') {
+          e.setData('facing', Math.random() < 0.5 ? -1 : 1);
+        }
       }
 
-      spawnPickup() {
-        if (this.gameOver) return;
-        const cam = this.cameras.main;
-        const x = Phaser.Math.Between(
-          Math.max(60, cam.scrollX + 100),
-          Math.min(CFG.WORLD_W - 60, cam.scrollX + cam.width - 60)
-        );
-        const vh = this.scale.height;
-        const tops = this.platformTops;
-        const surfaceY = Phaser.Utils.Array.GetRandom(tops);
-        const y = surfaceY - 40;
-        const isHealth = Math.random() < 0.55;
-        const tex = isHealth ? 'tex_health' : 'tex_powerup';
+      ensureHpBar(enemy) {
+        if (enemy.hpBar) return;
+        enemy.hpBar = this.add.graphics().setDepth(500);
+      }
+
+      onEnemyKilled(enemy) {
+        const kind = enemy.getData('kind');
+        const x = enemy.x;
+        const y = enemy.y;
+        if (enemy.hpBar) { enemy.hpBar.destroy(); enemy.hpBar = null; }
+        enemy.destroy();
+        this.score += CFG.SCORE_PER_KILL;
+        this.scoreText.setText('Score: ' + this.score);
+        if (Math.random() < CFG.DROP_RATE[kind]) {
+          const isHealth = Math.random() < CFG.HEALTH_SHARE[kind];
+          this.spawnPickup(x, y, isHealth ? 'health' : 'powerup');
+        }
+      }
+
+      spawnPickup(x, y, kind) {
+        const tex = kind === 'health' ? 'tex_health' : 'tex_powerup';
         const p = this.pickups.create(x, y, tex);
         p.body.setCircle(12);
-        p.setData('kind', isHealth ? 'health' : 'powerup');
+        p.body.setAllowGravity(false);
+        p.setData('kind', kind);
+        p.setData('expiresAt', this.time.now + CFG.PICKUP_LIFETIME_MS);
       }
 
       fireBullet() {
@@ -249,6 +391,14 @@
         b.body.setAllowGravity(false);
         b.body.setCircle(5);
         b.setVelocityX(this.facing * CFG.BULLET_SPEED);
+      }
+
+      fireShooterBullet(shooter) {
+        const facing = shooter.getData('facing');
+        const b = this.enemyBullets.create(shooter.x + facing * 22, shooter.y, 'tex_enemy_bullet');
+        b.body.setAllowGravity(false);
+        b.body.setCircle(5);
+        b.setVelocityX(facing * CFG.SHOOTER_BULLET_SPEED);
       }
 
       handlePlayerInput() {
@@ -278,16 +428,73 @@
       }
 
       updateEnemies() {
+        const r = CFG.ENEMY_RADIUS;
+        const now = this.time.now;
         this.enemies.getChildren().forEach((e) => {
           if (!e.active) return;
-          const dir = e.x > this.player.x ? -1 : 1;
-          e.setVelocityX(dir * CFG.ENEMY_SPEED);
+          const kind = e.getData('kind');
+          if (kind === 'runner') {
+            const dir = e.x > this.player.x ? -1 : 1;
+            e.setVelocityX(dir * CFG.ENEMY_SPEED);
+          } else if (kind === 'patroller') {
+            const surface = e.getData('surface');
+            let facing = e.getData('facing');
+            if (facing < 0 && e.x <= surface.left + r) { facing = 1; e.setData('facing', 1); }
+            else if (facing > 0 && e.x >= surface.right - r) { facing = -1; e.setData('facing', -1); }
+            e.setVelocityX(facing * CFG.PATROLLER_SPEED);
+          } else if (kind === 'shooter') {
+            e.setVelocityX(0);
+            const facing = this.player.x > e.x ? 1 : -1;
+            e.setData('facing', facing);
+            if (now >= e.getData('nextFireAt')) {
+              this.fireShooterBullet(e);
+              e.setData('nextFireAt', now + CFG.SHOOTER_FIRE_MS);
+            }
+          }
+        });
+      }
+
+      updateHpBars() {
+        const r = CFG.ENEMY_RADIUS;
+        this.enemies.getChildren().forEach((e) => {
+          if (!e.active || !e.hpBar) return;
+          const hp = e.getData('hp');
+          const hpMax = e.getData('hpMax');
+          const frac = Math.max(0, hp / hpMax);
+          const w = 24, h = 3;
+          const x = e.x - w / 2;
+          const y = e.y - r - 6;
+          e.hpBar.clear();
+          e.hpBar.fillStyle(0x222018, 1);
+          e.hpBar.fillRect(x, y, w, h);
+          e.hpBar.fillStyle(0xc94c4c, 1);
+          e.hpBar.fillRect(x, y, w * frac, h);
         });
       }
 
       cullBullets() {
         this.bullets.getChildren().forEach((b) => {
           if (b.active && (b.x < 0 || b.x > CFG.WORLD_W)) b.destroy();
+        });
+        this.enemyBullets.getChildren().forEach((b) => {
+          if (b.active && (b.x < 0 || b.x > CFG.WORLD_W)) b.destroy();
+        });
+      }
+
+      updatePickups() {
+        const now = this.time.now;
+        this.pickups.getChildren().forEach((p) => {
+          if (!p.active) return;
+          const expiresAt = p.getData('expiresAt');
+          if (now >= expiresAt) {
+            p.destroy();
+            return;
+          }
+          if (now >= expiresAt - CFG.PICKUP_BLINK_MS) {
+            p.setVisible(Math.floor(now / 100) % 2 === 0);
+          } else {
+            p.setVisible(true);
+          }
         });
       }
 
@@ -363,8 +570,7 @@
 
       enterGameOver() {
         this.gameOver = true;
-        this.enemySpawner.paused = true;
-        this.pickupSpawner.paused = true;
+        if (this.nextEnemyEvent) { this.nextEnemyEvent.remove(false); this.nextEnemyEvent = null; }
         this.physics.pause();
         this.gameOverScoreText.setText('Score: ' + this.score);
         this.gameOverOverlay.setVisible(true);
@@ -379,7 +585,9 @@
         }
         this.handlePlayerInput();
         this.updateEnemies();
+        this.updateHpBars();
         this.cullBullets();
+        this.updatePickups();
         this.updateInvulnFlash();
         this.updatePowerup();
       }
