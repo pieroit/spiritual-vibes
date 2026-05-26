@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sprite Cutter — Shame</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #1a1410; color: #fdf8f1;
+               font: 14px/1.4 Georgia, "Times New Roman", serif; }
+  #app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+  header { padding: 10px 14px; background: #2a221c; border-bottom: 1px solid #443; display: flex;
+           flex-wrap: wrap; gap: 10px; align-items: center; }
+  header label { display: inline-flex; gap: 4px; align-items: center; }
+  header input[type=number] { width: 64px; background: #1a1410; color: #fdf8f1; border: 1px solid #554;
+                              padding: 3px 6px; border-radius: 4px; }
+  header select, header button { background: #443; color: #fdf8f1; border: 1px solid #665;
+                                  padding: 4px 10px; border-radius: 4px; cursor: pointer; }
+  header button:hover { background: #554; }
+  header .sep { width: 1px; height: 24px; background: #443; }
+  header .info { color: #cfc4b0; font-size: 12px; }
+
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #443; min-height: 0; }
+  .pane { background: #1a1410; display: grid; grid-template-rows: auto 1fr; min-height: 0;
+          overflow: hidden; }
+  .pane h2 { margin: 0; padding: 6px 12px; background: #2a221c; font-size: 13px;
+             color: #b8893a; font-weight: normal; letter-spacing: 0.05em; text-transform: uppercase; }
+  .canvas-wrap { overflow: auto; background:
+      repeating-conic-gradient(#2a221c 0 25%, #1f1813 0 50%) 0 0/24px 24px; }
+  canvas { display: block; image-rendering: pixelated; }
+  .empty { padding: 20px; color: #cfc4b0; font-style: italic; }
+
+  footer { padding: 8px 14px; background: #2a221c; border-top: 1px solid #443; font-size: 12px;
+           color: #cfc4b0; }
+  kbd { background: #443; padding: 1px 6px; border-radius: 3px; font-family: monospace;
+        font-size: 11px; color: #fdf8f1; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <label><input type="file" id="file" accept="image/*"></label>
+    <button id="addBtn" title="Or shift+drag on canvas">+ Frame</button>
+    <button id="delBtn" title="Or press Delete">– Frame</button>
+    <span class="sep"></span>
+    <label>Padding <input type="number" id="pad" value="8" min="0" max="200"></label>
+    <label>V-align
+      <select id="valign">
+        <option value="bottom" selected>bottom (feet)</option>
+        <option value="center">center</option>
+        <option value="top">top</option>
+      </select>
+    </label>
+    <label>H-align
+      <select id="halign">
+        <option value="center" selected>center</option>
+        <option value="left">left</option>
+        <option value="right">right</option>
+      </select>
+    </label>
+    <span class="sep"></span>
+    <button id="savePng">Save PNG</button>
+    <button id="saveJson">Save cuts.json</button>
+    <button id="loadJson">Load cuts.json</button>
+    <input type="file" id="jsonFile" accept=".json,application/json" style="display:none">
+    <span class="sep"></span>
+    <label>FPS <input type="number" id="fps" value="8" min="1" max="60"></label>
+    <label>Zoom <input type="number" id="zoom" value="2" min="1" max="16" step="1"></label>
+    <button id="playBtn" title="Play/Pause">⏸ Pause</button>
+    <span class="sep"></span>
+    <span class="info" id="info">No image loaded.</span>
+  </header>
+
+  <main>
+    <section class="pane">
+      <h2>Source — drag to move, handles to resize, shift+drag = new frame</h2>
+      <div class="canvas-wrap" id="srcWrap"><canvas id="src" width="800" height="400"></canvas></div>
+    </section>
+    <section class="pane">
+      <h2>Preview — live animation</h2>
+      <div class="canvas-wrap" id="prevWrap" style="display:flex; align-items:center; justify-content:center;">
+        <canvas id="prev" width="400" height="200"></canvas>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <kbd>shift+drag</kbd> new frame &nbsp;
+  <kbd>drag</kbd> move &nbsp;
+  <kbd>handles</kbd> resize &nbsp;
+  <kbd>click</kbd> select &nbsp;
+  <kbd>Delete</kbd>/<kbd>Backspace</kbd> remove selected &nbsp;
+  <kbd>←</kbd>/<kbd>→</kbd> reorder selected
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const srcCanvas = $('src'), prevCanvas = $('prev');
+const sctx = srcCanvas.getContext('2d');
+const pctx = prevCanvas.getContext('2d');
+
+const state = {
+  img: null,
+  imgName: 'sprite',
+  // rects in IMAGE coords: {x,y,w,h,id}
+  rects: [],
+  selectedId: null,
+  nextId: 1,
+  drag: null,
+  viewScale: 1, // image px per screen px when drawn
+};
+
+function setInfo(s) { $('info').textContent = s; }
+
+// ----- Image loading -----
+$('file').addEventListener('change', (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  state.imgName = f.name.replace(/\.[^.]+$/, '');
+  const img = new Image();
+  img.onload = () => {
+    state.img = img;
+    state.rects = [];
+    state.selectedId = null;
+    fitSourceCanvas();
+    setInfo(`${img.naturalWidth}×${img.naturalHeight} — ${f.name}`);
+    redraw();
+  };
+  img.src = URL.createObjectURL(f);
+});
+
+// Fit source canvas to image at a reasonable on-screen size
+function fitSourceCanvas() {
+  const wrap = $('srcWrap');
+  const maxW = wrap.clientWidth - 4;
+  const maxH = wrap.clientHeight - 4;
+  const iw = state.img.naturalWidth, ih = state.img.naturalHeight;
+  const s = Math.min(maxW / iw, maxH / ih, 1);
+  state.viewScale = s;
+  srcCanvas.width = Math.round(iw * s);
+  srcCanvas.height = Math.round(ih * s);
+}
+
+window.addEventListener('resize', () => {
+  if (state.img) { fitSourceCanvas(); redraw(); }
+});
+
+// ----- Coordinate transforms -----
+function screenToImg(sx, sy) {
+  const r = srcCanvas.getBoundingClientRect();
+  return {
+    x: (sx - r.left) / state.viewScale,
+    y: (sy - r.top) / state.viewScale,
+  };
+}
+
+// ----- Rect ordering by x (so frame 0 is leftmost) -----
+function orderedRects() {
+  return [...state.rects].sort((a, b) => a.x - b.x);
+}
+
+// ----- Hit-testing -----
+const HANDLE = 8; // screen px
+function hitTest(p) {
+  // Test selected rect's handles first, then any rect's body (topmost = last-clicked = selected last)
+  const ordered = orderedRects();
+  // Check selected handles
+  const sel = state.rects.find(r => r.id === state.selectedId);
+  if (sel) {
+    const hs = handleRectsImg(sel);
+    for (const h of hs) {
+      if (p.x >= h.x && p.x <= h.x + h.w && p.y >= h.y && p.y <= h.y + h.h) {
+        return { kind: 'handle', rect: sel, handle: h.name };
+      }
+    }
+  }
+  // Bodies — pick the smallest-area rect under cursor (so a small rect inside a big one is selectable)
+  let pick = null;
+  for (const r of state.rects) {
+    if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) {
+      if (!pick || r.w * r.h < pick.w * pick.h) pick = r;
+    }
+  }
+  if (pick) return { kind: 'body', rect: pick };
+  return null;
+}
+
+function handleRectsImg(r) {
+  const s = HANDLE / state.viewScale; // handle size in image coords
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  const pts = [
+    ['nw', r.x, r.y], ['n', cx, r.y], ['ne', r.x + r.w, r.y],
+    ['w', r.x, cy],                    ['e', r.x + r.w, cy],
+    ['sw', r.x, r.y + r.h], ['s', cx, r.y + r.h], ['se', r.x + r.w, r.y + r.h]
+  ];
+  return pts.map(([name, x, y]) => ({ name, x: x - s / 2, y: y - s / 2, w: s, h: s }));
+}
+
+// ----- Drag interaction -----
+srcCanvas.addEventListener('pointerdown', (e) => {
+  if (!state.img) return;
+  srcCanvas.setPointerCapture(e.pointerId);
+  const p = screenToImg(e.clientX, e.clientY);
+
+  // shift+drag = create new rect
+  if (e.shiftKey) {
+    const r = { id: state.nextId++, x: p.x, y: p.y, w: 1, h: 1 };
+    state.rects.push(r);
+    state.selectedId = r.id;
+    state.drag = { kind: 'create', rect: r, startX: p.x, startY: p.y };
+    redraw();
+    return;
+  }
+
+  const hit = hitTest(p);
+  if (!hit) {
+    state.selectedId = null;
+    redraw();
+    return;
+  }
+
+  state.selectedId = hit.rect.id;
+  if (hit.kind === 'handle') {
+    state.drag = { kind: 'resize', rect: hit.rect, handle: hit.handle, startX: p.x, startY: p.y,
+                   orig: { ...hit.rect } };
+  } else {
+    state.drag = { kind: 'move', rect: hit.rect, startX: p.x, startY: p.y,
+                   orig: { ...hit.rect } };
+  }
+  redraw();
+});
+
+srcCanvas.addEventListener('pointermove', (e) => {
+  if (!state.img) return;
+  const p = screenToImg(e.clientX, e.clientY);
+
+  // Update cursor based on hover
+  if (!state.drag) {
+    const hit = hitTest(p);
+    srcCanvas.style.cursor = !hit ? (e.shiftKey ? 'crosshair' : 'default')
+      : hit.kind === 'handle' ? cursorFor(hit.handle) : 'move';
+  }
+
+  if (!state.drag) return;
+
+  const d = state.drag;
+  if (d.kind === 'create') {
+    d.rect.x = Math.min(d.startX, p.x);
+    d.rect.y = Math.min(d.startY, p.y);
+    d.rect.w = Math.abs(p.x - d.startX);
+    d.rect.h = Math.abs(p.y - d.startY);
+  } else if (d.kind === 'move') {
+    d.rect.x = d.orig.x + (p.x - d.startX);
+    d.rect.y = d.orig.y + (p.y - d.startY);
+  } else if (d.kind === 'resize') {
+    resizeRect(d.rect, d.orig, d.handle, p.x - d.startX, p.y - d.startY);
+  }
+  redraw();
+});
+
+srcCanvas.addEventListener('pointerup', (e) => {
+  if (state.drag) {
+    // Tidy: any rect <2px in image coords gets removed
+    const r = state.drag.rect;
+    if (r.w < 2 || r.h < 2) {
+      state.rects = state.rects.filter(x => x !== r);
+      state.selectedId = null;
+    }
+    // Normalize negative w/h
+    state.rects.forEach(r => {
+      if (r.w < 0) { r.x += r.w; r.w = -r.w; }
+      if (r.h < 0) { r.y += r.h; r.h = -r.h; }
+    });
+  }
+  state.drag = null;
+  redraw();
+});
+
+function cursorFor(h) {
+  return { n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
+           ne: 'nesw-resize', sw: 'nesw-resize', nw: 'nwse-resize', se: 'nwse-resize' }[h];
+}
+
+function resizeRect(r, orig, handle, dx, dy) {
+  let x = orig.x, y = orig.y, w = orig.w, h = orig.h;
+  if (handle.includes('w')) { x = orig.x + dx; w = orig.w - dx; }
+  if (handle.includes('e')) { w = orig.w + dx; }
+  if (handle.includes('n')) { y = orig.y + dy; h = orig.h - dy; }
+  if (handle.includes('s')) { h = orig.h + dy; }
+  r.x = x; r.y = y; r.w = w; r.h = h;
+}
+
+// ----- Keyboard -----
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (state.selectedId != null) {
+      state.rects = state.rects.filter(r => r.id !== state.selectedId);
+      state.selectedId = null;
+      redraw();
+      e.preventDefault();
+    }
+  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    // Reorder selected by nudging x — but ordering is by x anyway, so we just nudge it
+    const sel = state.rects.find(r => r.id === state.selectedId);
+    if (sel) { sel.x += (e.key === 'ArrowRight' ? 5 : -5); redraw(); }
+  }
+});
+
+// ----- Buttons -----
+$('addBtn').addEventListener('click', () => {
+  if (!state.img) return;
+  const iw = state.img.naturalWidth, ih = state.img.naturalHeight;
+  const w = Math.round(iw * 0.2), h = Math.round(ih * 0.5);
+  const r = { id: state.nextId++,
+              x: Math.round((iw - w) / 2), y: Math.round((ih - h) / 2),
+              w, h };
+  state.rects.push(r);
+  state.selectedId = r.id;
+  redraw();
+});
+
+$('delBtn').addEventListener('click', () => {
+  if (state.selectedId == null) return;
+  state.rects = state.rects.filter(r => r.id !== state.selectedId);
+  state.selectedId = null;
+  redraw();
+});
+
+['pad', 'valign', 'halign', 'fps', 'zoom'].forEach(id => $(id).addEventListener('input', redraw));
+
+let playing = true;
+$('playBtn').addEventListener('click', () => {
+  playing = !playing;
+  $('playBtn').textContent = playing ? '⏸ Pause' : '▶ Play';
+});
+
+$('savePng').addEventListener('click', () => {
+  if (!state.img || state.rects.length === 0) return;
+  const pack = computePack();
+  const canvas = document.createElement('canvas');
+  canvas.width = pack.cellW * pack.frames.length;
+  canvas.height = pack.cellH;
+  const ctx = canvas.getContext('2d');
+  for (let i = 0; i < pack.frames.length; i++) {
+    const f = pack.frames[i];
+    ctx.drawImage(state.img, f.src.x, f.src.y, f.src.w, f.src.h,
+      i * pack.cellW + f.dst.x, f.dst.y, f.src.w, f.src.h);
+  }
+  canvas.toBlob((blob) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${state.imgName}_packed.png`;
+    a.click();
+  }, 'image/png');
+});
+
+$('saveJson').addEventListener('click', () => {
+  const data = {
+    image: state.imgName,
+    padding: +$('pad').value,
+    valign: $('valign').value,
+    halign: $('halign').value,
+    frames: orderedRects().map(r => ({
+      x: Math.round(r.x), y: Math.round(r.y),
+      w: Math.round(r.w), h: Math.round(r.h)
+    }))
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${state.imgName}_cuts.json`;
+  a.click();
+});
+
+$('loadJson').addEventListener('click', () => $('jsonFile').click());
+$('jsonFile').addEventListener('change', (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then((txt) => {
+    const d = JSON.parse(txt);
+    if (d.padding != null) $('pad').value = d.padding;
+    if (d.valign) $('valign').value = d.valign;
+    if (d.halign) $('halign').value = d.halign;
+    state.rects = (d.frames || []).map(r => ({ ...r, id: state.nextId++ }));
+    state.selectedId = null;
+    redraw();
+  });
+});
+
+// ----- Pack computation (used by preview + save) -----
+function computePack() {
+  const pad = Math.max(0, +$('pad').value || 0);
+  const valign = $('valign').value;
+  const halign = $('halign').value;
+  const rects = orderedRects().map(r => ({
+    x: Math.max(0, Math.round(r.x)),
+    y: Math.max(0, Math.round(r.y)),
+    w: Math.max(1, Math.round(r.w)),
+    h: Math.max(1, Math.round(r.h)),
+  }));
+  if (rects.length === 0) return { cellW: 0, cellH: 0, frames: [] };
+  const maxW = Math.max(...rects.map(r => r.w));
+  const maxH = Math.max(...rects.map(r => r.h));
+  const cellW = maxW + pad * 2;
+  const cellH = maxH + pad * 2;
+  const frames = rects.map(r => {
+    let dx, dy;
+    if (halign === 'left') dx = pad;
+    else if (halign === 'right') dx = cellW - pad - r.w;
+    else dx = Math.round((cellW - r.w) / 2);
+    if (valign === 'top') dy = pad;
+    else if (valign === 'center') dy = Math.round((cellH - r.h) / 2);
+    else dy = cellH - pad - r.h; // bottom
+    return { src: r, dst: { x: dx, y: dy } };
+  });
+  return { cellW, cellH, frames };
+}
+
+// ----- Drawing -----
+function redraw() {
+  drawSource();
+  drawPreview();
+}
+
+function drawSource() {
+  sctx.clearRect(0, 0, srcCanvas.width, srcCanvas.height);
+  if (!state.img) return;
+  sctx.drawImage(state.img, 0, 0, srcCanvas.width, srcCanvas.height);
+  const s = state.viewScale;
+  const ordered = orderedRects();
+  ordered.forEach((r, i) => {
+    const sel = r.id === state.selectedId;
+    sctx.lineWidth = sel ? 2 : 1.5;
+    sctx.strokeStyle = sel ? '#ffe45c' : '#4aa3ff';
+    sctx.fillStyle = sel ? 'rgba(255,228,92,0.10)' : 'rgba(74,163,255,0.07)';
+    sctx.fillRect(r.x * s, r.y * s, r.w * s, r.h * s);
+    sctx.strokeRect(r.x * s, r.y * s, r.w * s, r.h * s);
+    // Label
+    sctx.fillStyle = sel ? '#ffe45c' : '#4aa3ff';
+    sctx.font = 'bold 13px Georgia, serif';
+    sctx.fillText(`#${i}`, r.x * s + 4, r.y * s + 14);
+    if (sel) {
+      // Draw handles
+      const hs = handleRectsImg(r);
+      sctx.fillStyle = '#ffe45c';
+      hs.forEach(h => sctx.fillRect(h.x * s, h.y * s, h.w * s, h.h * s));
+    }
+  });
+}
+
+// drawPreview() just sizes the canvas + updates the info bar.
+// The actual frame display is driven by the animation loop below.
+function drawPreview() {
+  if (!state.img || state.rects.length === 0) {
+    prevCanvas.width = 400; prevCanvas.height = 100;
+    pctx.clearRect(0, 0, prevCanvas.width, prevCanvas.height);
+    pctx.fillStyle = '#cfc4b0';
+    pctx.font = '13px Georgia';
+    pctx.fillText('Add frames on the left to see animation.', 20, 30);
+    setInfo(state.img ? `${state.img.naturalWidth}×${state.img.naturalHeight} — no frames yet`
+                       : 'No image loaded.');
+    return;
+  }
+  const pack = computePack();
+  const zoom = Math.max(1, Math.min(16, +$('zoom').value || 1));
+  prevCanvas.width = pack.cellW * zoom;
+  prevCanvas.height = pack.cellH * zoom;
+  const totalW = pack.cellW * pack.frames.length;
+  setInfo(`${state.img.naturalWidth}×${state.img.naturalHeight} — ${pack.frames.length} frames — ` +
+          `cell ${pack.cellW}×${pack.cellH} — output PNG ${totalW}×${pack.cellH}`);
+}
+
+// Animation loop — draws the currently-active frame onto the preview canvas.
+let lastFrameTime = 0;
+let currentFrame = 0;
+function tick(t) {
+  if (state.img && state.rects.length > 0) {
+    const pack = computePack();
+    const fps = Math.max(1, +$('fps').value || 8);
+    const frameDur = 1000 / fps;
+    if (playing && t - lastFrameTime >= frameDur) {
+      currentFrame = (currentFrame + 1) % pack.frames.length;
+      lastFrameTime = t;
+    }
+    if (currentFrame >= pack.frames.length) currentFrame = 0;
+    const zoom = Math.max(1, Math.min(16, +$('zoom').value || 1));
+    pctx.clearRect(0, 0, prevCanvas.width, prevCanvas.height);
+    pctx.imageSmoothingEnabled = false;
+    const f = pack.frames[currentFrame];
+    pctx.drawImage(state.img,
+      f.src.x, f.src.y, f.src.w, f.src.h,
+      f.dst.x * zoom, f.dst.y * zoom,
+      f.src.w * zoom, f.src.h * zoom);
+    // Cell border so user can see the framing
+    pctx.strokeStyle = 'rgba(255,228,92,0.35)';
+    pctx.lineWidth = 1;
+    pctx.strokeRect(0.5, 0.5, prevCanvas.width - 1, prevCanvas.height - 1);
+    // Frame number badge
+    pctx.fillStyle = 'rgba(0,0,0,0.55)';
+    pctx.fillRect(4, 4, 38, 18);
+    pctx.fillStyle = '#ffe45c';
+    pctx.font = 'bold 12px Georgia, serif';
+    pctx.fillText(`#${currentFrame}`, 8, 17);
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+redraw();
+</script>
+</body>
+</html>

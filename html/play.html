@@ -71,12 +71,12 @@
   <div id="game"></div>
   <div class="touch-controls" aria-hidden="true">
     <div class="cluster left">
-      <button type="button" data-action="shoot" aria-label="Shoot">✦</button>
-      <button type="button" data-action="jump" aria-label="Jump">▲</button>
-    </div>
-    <div class="cluster right">
       <button type="button" data-action="left" aria-label="Move left">◀</button>
       <button type="button" data-action="right" aria-label="Move right">▶</button>
+    </div>
+    <div class="cluster right">
+      <button type="button" data-action="jump" aria-label="Jump">▲</button>
+      <button type="button" data-action="shoot" aria-label="Shoot">◉</button>
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/phaser@4.1.0/dist/phaser.min.js"></script>
@@ -196,7 +196,12 @@
 
       preload() {
         this.load.image('bg', 'assets/background.jpeg');
+        this.load.image('texture', 'assets/texture.png');
         this.load.audio('soundtrack', 'assets/soundtrack.mp3');
+        this.load.image('pope', 'assets/pope.png');
+        this.load.image('enemy_drone', 'assets/enemy_drone.png');
+        this.load.image('enemy_goblin', 'assets/enemy_goblin.png');
+        this.load.image('enemy_transumanoid', 'assets/enemy_transumanoid.png');
       }
 
       create() {
@@ -266,33 +271,37 @@
           g.generateTexture(key, r * 2, r * 2);
           g.destroy();
         };
-        mkCircle('tex_player', CFG.COLORS.player, 20);
-        mkCircle('tex_runner', CFG.COLORS.runner, CFG.ENEMY_RADIUS);
-        mkCircle('tex_patroller', CFG.COLORS.patroller, CFG.ENEMY_RADIUS);
-        mkCircle('tex_shooter', CFG.COLORS.shooter, CFG.ENEMY_RADIUS);
-        mkCircle('tex_bullet', CFG.COLORS.bullet, 5);
-        mkCircle('tex_enemy_bullet', CFG.COLORS.enemyBullet, 5);
+        // Enemy sprites are real images now (assigned in spawnEnemy); no circle textures needed.
+        const mkCross = (key, color) => {
+          const w = 18, h = 12, thick = 3;
+          const g = this.add.graphics();
+          g.fillStyle(color, 1);
+          g.fillRect(0, (h - thick) / 2, w, thick);
+          // Crosspiece near the right end => head of the crucifix on the right.
+          g.fillRect(w - thick * 2, 0, thick, h);
+          g.generateTexture(key, w, h);
+          g.destroy();
+        };
+        mkCross('tex_bullet', CFG.COLORS.bullet);
+        mkCross('tex_enemy_bullet', CFG.COLORS.enemyBullet);
         mkCircle('tex_health', CFG.COLORS.health, 12);
         mkCircle('tex_powerup', CFG.COLORS.powerup, 12);
+      }
 
-        const gr = this.add.graphics();
-        gr.fillStyle(CFG.COLORS.ground, 1);
-        gr.fillRect(0, 0, 32, 32);
-        gr.generateTexture('tex_ground', 32, 32);
-        gr.destroy();
-
-        const gp = this.add.graphics();
-        gp.fillStyle(CFG.COLORS.platform, 1);
-        gp.fillRect(0, 0, 32, 32);
-        gp.generateTexture('tex_platform', 32, 32);
-        gp.destroy();
+      addTexturedPlatform(x, y, w, h) {
+        const tex = this.textures.get('texture').getSourceImage();
+        const tileScale = (h < 40 ? h / tex.height : 64 / tex.height) * 5;
+        const sprite = this.add.tileSprite(x, y, w, h, 'texture');
+        sprite.setTileScale(tileScale, tileScale);
+        this.physics.add.existing(sprite, true);
+        this.platforms.add(sprite);
+        return sprite;
       }
 
       buildWorld(vh) {
         this.platforms = this.physics.add.staticGroup();
         const groundY = vh - CFG.GROUND_H / 2;
-        const ground = this.platforms.create(CFG.WORLD_W / 2, groundY, 'tex_ground');
-        ground.setDisplaySize(CFG.WORLD_W, CFG.GROUND_H).refreshBody();
+        this.addTexturedPlatform(CFG.WORLD_W / 2, groundY, CFG.WORLD_W, CFG.GROUND_H);
 
         const platDefs = [
           { x: 500, y: vh - 180, w: 220 },
@@ -313,8 +322,7 @@
         }];
 
         for (const p of platDefs) {
-          const plat = this.platforms.create(p.x, p.y, 'tex_platform');
-          plat.setDisplaySize(p.w, 20).refreshBody();
+          const plat = this.addTexturedPlatform(p.x, p.y, p.w, 20);
           this.surfaces.push({
             left: p.x - p.w / 2,
             right: p.x + p.w / 2,
@@ -325,9 +333,14 @@
       }
 
       spawnPlayer(vh) {
-        this.player = this.physics.add.sprite(120, vh - 200, 'tex_player');
+        this.player = this.physics.add.sprite(120, vh - 200, 'pope');
         this.player.setCollideWorldBounds(true);
-        this.player.body.setCircle(20);
+        // pope.png is 339x423. Scale down by a fixed factor so display math is stable.
+        const SCALE = 1 / 4;
+        this.player.setScale(SCALE);
+        // 20px-radius circle in display space => 60 in texture space (since 1/3 scale).
+        const R = 60;
+        this.player.body.setCircle(R, 339 / 2 - R, 423 - R * 2 - 20);
         this.physics.add.collider(this.player, this.platforms);
       }
 
@@ -390,10 +403,10 @@
           A: Phaser.Input.Keyboard.KeyCodes.A,
           D: Phaser.Input.Keyboard.KeyCodes.D,
           W: Phaser.Input.Keyboard.KeyCodes.W,
-          Z: Phaser.Input.Keyboard.KeyCodes.Z,
           CTRL: Phaser.Input.Keyboard.KeyCodes.CTRL,
           ENTER: Phaser.Input.Keyboard.KeyCodes.ENTER
         });
+        this.shootKeys = this.input.keyboard.addKeys('Z,X,C,V,B,N,M');
       }
 
       setupCamera(vh) {
@@ -458,10 +471,17 @@
         const x = pick.spawnLeft === pick.spawnRight
           ? pick.spawnLeft
           : Phaser.Math.Between(pick.spawnLeft, pick.spawnRight);
-        const y = surface.top - r - 1;
-        const tex = kind === 'runner' ? 'tex_runner' : kind === 'patroller' ? 'tex_patroller' : 'tex_shooter';
+        // runner = data-goblin, patroller = algo-drone, shooter = transumanoid
+        const tex = kind === 'runner' ? 'enemy_goblin' : kind === 'patroller' ? 'enemy_drone' : 'enemy_transumanoid';
+        const displayH = r * 7;
+        const y = surface.top - displayH / 2;
         const e = this.enemies.create(x, y, tex);
-        e.body.setCircle(r);
+        e.setScale(displayH / e.height);
+        // Physics body: circle of display-radius r*2, hugging the bottom of the sprite so feet sit on the surface.
+        const bodyDiameterTex = (r * 4) / e.scaleX;
+        const offsetXTex = e.width / 2 - bodyDiameterTex / 2;
+        const offsetYTex = e.height - bodyDiameterTex;
+        e.body.setCircle(bodyDiameterTex / 2, offsetXTex, offsetYTex);
         e.setCollideWorldBounds(false);
         const hp = CFG.HP[kind];
         e.setData('kind', kind);
@@ -533,14 +553,14 @@
           Phaser.Input.Keyboard.JustDown(this.cursors.up) ||
           Phaser.Input.Keyboard.JustDown(this.keys.W) ||
           touchJump;
-        const shoot = this.keys.Z.isDown || this.keys.CTRL.isDown || touchInput.shoot;
+        const shoot = this.keys.CTRL.isDown || touchInput.shoot || Object.values(this.shootKeys).some(k => k.isDown);
 
         if (left) {
           this.player.setVelocityX(-CFG.PLAYER_SPEED);
-          this.facing = -1;
+          if (this.facing !== -1) { this.facing = -1; this.player.setFlipX(true); }
         } else if (right) {
           this.player.setVelocityX(CFG.PLAYER_SPEED);
-          this.facing = 1;
+          if (this.facing !== 1) { this.facing = 1; this.player.setFlipX(false); }
         } else {
           this.player.setVelocityX(0);
         }
@@ -588,7 +608,7 @@
           const frac = Math.max(0, hp / hpMax);
           const w = 24, h = 3;
           const x = e.x - w / 2;
-          const y = e.y - r - 6;
+          const y = e.y - e.displayHeight / 2 - 6;
           e.hpBar.clear();
           e.hpBar.fillStyle(0x222018, 1);
           e.hpBar.fillRect(x, y, w, h);
@@ -621,11 +641,6 @@
             p.setVisible(true);
           }
         });
-      }
-
-      updateInvulnFlash() {
-        const inv = this.time.now < this.invulnUntil;
-        this.player.setAlpha(inv ? (Math.floor(this.time.now / 80) % 2 ? 0.35 : 1) : 1);
       }
 
       updatePowerup() {
@@ -717,7 +732,6 @@
         this.updateHpBars();
         this.cullBullets();
         this.updatePickups();
-        this.updateInvulnFlash();
         this.updatePowerup();
       }
     }
@@ -726,6 +740,7 @@
       type: Phaser.AUTO,
       parent: 'game',
       backgroundColor: '#1a1410',
+      pixelArt: true,
       physics: {
         default: 'arcade',
         arcade: { gravity: { y: CFG.GRAVITY }, debug: false }
